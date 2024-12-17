@@ -1,6 +1,4 @@
 import torch
-torch.backends.cudnn.enabled = True
-torch.backends.cudnn.benchmark = True
 import torch.nn as nn
 import torch.nn.functional as F
 import math
@@ -17,6 +15,47 @@ try:
     from selective_scan import selective_scan_ref as selective_scan_ref_v1
 except:
     pass
+
+
+def to_3d(x):
+    return rearrange(x, 'b c h w -> b (h w) c')
+
+def to_4d(x, h, w):
+    return rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+
+
+## Resizing modules
+class Downsample(nn.Module):
+    def __init__(self, n_feat):
+        super(Downsample, self).__init__()
+
+        self.body = nn.Sequential(nn.Conv2d(n_feat, n_feat//2, kernel_size=3, stride=1, padding=1, bias=False),
+                                  nn.PixelUnshuffle(2))
+
+    def forward(self, x):
+        return self.body(x)
+
+class Upsample(nn.Module):
+    def __init__(self, n_feat):
+        super(Upsample, self).__init__()
+
+        self.body = nn.Sequential(nn.Conv2d(n_feat, n_feat*2, kernel_size=3, stride=1, padding=1, bias=False),
+                                  nn.PixelShuffle(2))
+
+    def forward(self, x):
+        return self.body(x)
+
+class OverlapPatchEmbed(nn.Module):
+    def __init__(self, in_c=3, embed_dim=32, bias=False):
+        super(OverlapPatchEmbed, self).__init__()
+
+        self.proj = nn.Conv2d(in_c, embed_dim, kernel_size=3, stride=1, padding=1, bias=bias)
+
+    def forward(self, x):
+        x = self.proj(x)
+
+        return x
+
 
 # LoRA模块
 class LoRALinear(nn.Module):
@@ -37,8 +76,8 @@ class LoRALinear(nn.Module):
         lora_update = (self.lora_B @ self.lora_A) * self.scaling
         return F.linear(x, self.weight + lora_update, self.bias)
 
-
-class AdaptiveMambaScan2D(nn.Module):
+# SS2D模块
+class AdapiveSS2D(nn.Module):
     def __init__(
         self,
         d_model,
@@ -135,7 +174,7 @@ class AdaptiveMambaScan2D(nn.Module):
         for i in range(4):  # 4个路径
             cache_key = f"{cache_key_prefix}_{i}"
             xs_i = self.kv_cache_update(xs[:, i], cache_key)
-            result = xs_i.view(B, C, H, W)  
+            result = xs_i.view(B, C, H, W)  # 确保正确形状
             out_states.append(result)
 
         # 路径权重加权融合
@@ -182,7 +221,7 @@ class LayerNorm(nn.Module):
             x = self.weight[:, None, None] * x + self.bias[:, None, None]
             return x
 
-
+# FC
 class FC(nn.Module):
     def __init__(self, dim, growth_rate=2.0):
         super().__init__()
@@ -197,7 +236,7 @@ class FC(nn.Module):
     def forward(self, x):
         return self.fc(x)
 
-
+# SAFM
 class AttBlock(nn.Module):
     def __init__(self, dim, n_levels=4):
         super().__init__()
@@ -214,7 +253,7 @@ class AttBlock(nn.Module):
         self.act = nn.GELU() 
         
         # SS2D
-        self.ss2d = AdaptiveMambaScan2D(d_model=chunk_dim, use_lora=True, use_cache=True)
+        self.ss2d = AdapiveSS2D(d_model=chunk_dim, use_lora=True, use_cache=True)
 
     def forward(self, x):
         h, w = x.size()[-2:]
@@ -236,42 +275,107 @@ class AttBlock(nn.Module):
         return out
 
 
-class AdaptiveBlock(nn.Module):
-    def __init__(self, dim, ffn_scale=2.0):
+class TransformerBlock(nn.Module):
+    def __init__(self, dim):
         super().__init__()
-
-        self.norm1 = LayerNorm(dim) 
-        self.norm2 = LayerNorm(dim) 
-
-        # Multiscale Block
-        self.safm = AttBlock(dim) 
-        # Feedforward layer
-        self.ccm = FC(dim, ffn_scale) 
-
+        self.norm1 = LayerNorm(dim)
+        self.norm2 = LayerNorm(dim)
+        self.attn = AttBlock(dim)
+        self.ffn = FC(dim)
+        
     def forward(self, x):
-        x = self.safm(self.norm1(x)) + x
-        x = self.ccm(self.norm2(x)) + x
+        x = self.attn(self.norm1(x)) + x
+        x = self.ffn(self.norm2(x)) + x
+        return x
+
+class StageModule(nn.Module):
+    def __init__(self, dim, num_blocks):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            TransformerBlock(dim) 
+            for _ in range(num_blocks)
+        ])
+    
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
         return x
 
 
 class AdaptiveMamba(nn.Module):
-    def __init__(self, dim=48, ffn_scale=2.0, upscaling_factor=4):
+    def __init__(
+        self, 
+        inp_channels=3, 
+        dim=32
+    ):
         super().__init__()
-        self.to_feat = nn.Sequential(
-            nn.Conv2d(3, dim // upscaling_factor, 3, 1, 1),
-            nn.PixelUnshuffle(upscaling_factor)
-        )
-        out_dim = upscaling_factor * dim
-        self.feats = nn.Sequential(*[AdaptiveBlock(out_dim, ffn_scale=2.0) for _ in range(8)])
-        self.to_img = nn.Sequential(
-            nn.Conv2d(out_dim, 3 * (upscaling_factor ** 2), 3, 1, 1),  # Modified to output 3 channels
-            nn.PixelShuffle(upscaling_factor)
+        
+        # Initial feature extraction
+        self.embed_conv = nn.Conv2d(inp_channels, dim, 3, 2, 1, bias=False)
+        self.embed_block = TransformerBlock(dim)
+        
+        # Encoder stages
+        self.stage1 = StageModule(dim, num_blocks=2)
+        self.down1 = nn.Sequential(
+            nn.Conv2d(dim, dim*2, 3, 2, 1, groups=dim, bias=False),
+            nn.Conv2d(dim*2, dim*2, 1, bias=False)
         )
         
+        self.stage2 = StageModule(dim*2, num_blocks=3)
+        self.down2 = nn.Sequential(
+            nn.Conv2d(dim*2, dim*4, 3, 2, 1, groups=dim*2, bias=False),
+            nn.Conv2d(dim*4, dim*4, 1, bias=False)
+        )
+        
+        self.stage3 = StageModule(dim*4, num_blocks=3)
+        
+        # Decoder stages
+        self.up2 = nn.Sequential(
+            nn.Conv2d(dim*4, dim*2*4, 1, bias=False),
+            nn.PixelShuffle(2)
+        )
+        
+        self.dec_stage2 = TransformerBlock(dim*2)
+        
+        self.up1 = nn.Sequential(
+            nn.Conv2d(dim*2, dim*4, 1, bias=False),
+            nn.PixelShuffle(2)
+        )
+        
+        self.dec_stage1 = TransformerBlock(dim)
+        
+        # Output projection
+        self.output = nn.Sequential(
+            nn.Conv2d(dim, inp_channels*4, 3, 1, 1, bias=False),
+            nn.PixelShuffle(2)
+        )
 
     def forward(self, x):
-        x = self.to_feat(x)
-        x = self.feats(x) + x
-        x = self.to_img(x)
-        return x
+        # Initial feature extraction
+        feat = self.embed_conv(x)
+        feat = self.embed_block(feat)
+        
+        # Encoder path
+        out1 = self.stage1(feat)
+        out2 = self.stage2(self.down1(out1))
+        out3 = self.stage3(self.down2(out2))
+        
+        # Decoder path with skip connections
+        d2 = self.dec_stage2(self.up2(out3) + out2)
+        d1 = self.dec_stage1(self.up1(d2) + out1)
+        
+        return self.output(d1) + x
 
+
+if __name__ == '__main__':
+    x = torch.randn(2, 3, 1024//4, 1024//4).cuda()
+    model = AdaptiveMamba().cuda()
+    from fvcore.nn import flop_count_table, FlopCountAnalysis, ActivationCountAnalysis
+    print(f'params: {sum(map(lambda x: x.numel(), model.parameters()))}')
+    print(flop_count_table(FlopCountAnalysis(model, x), activations=ActivationCountAnalysis(model, x)))
+    with torch.no_grad():
+        start_time = time.time()
+        output = model(x)
+        end_time = time.time()
+    running_time = end_time - start_time
+    print(running_time)
